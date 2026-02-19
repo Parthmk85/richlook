@@ -19,35 +19,49 @@ export interface PaymentRecord {
     status: 'payment_received';
 }
 
-// ─── SBI SMS Patterns ─────────────────────────────────────────────────────────
-const SBI_PATTERNS = [
-    /credited\s+by\s+rs\.?\s*([\d,]+\.?\d*)/i,
-    /rs\.?\s*([\d,]+\.?\d*)\s+credited/i,
-    /rs\.?\s*([\d,]+\.?\d*)\s+is\s+received/i,
-    /received.*?rs\.?\s*([\d,]+\.?\d*)/i,
-    /credited.*?rs\.?\s*([\d,]+\.?\d*)/i,
+// ─── Payment Patterns (SBI, IDBI, HDFC, etc.) ─────────────────────────────────
+const PAYMENT_PATTERNS = [
+    /credited\s+by\s+(?:Rs\.?|INR)\s*([\d,]+\.?\d*)/i,
+    /credited\s+for\s+(?:Rs\.?|INR)\s*([\d,]+\.?\d*)/i, // IDBI style
+    /(?:Rs\.?|INR)\s*([\d,]+\.?\d*)\s+credited/i,
+    /(?:Rs\.?|INR)\s*([\d,]+\.?\d*)\s+is\s+received/i,
+    /received.*?(?:Rs\.?|INR)\s*([\d,]+\.?\d*)/i,
+    /credited.*?(?:Rs\.?|INR)\s*([\d,]+\.?\d*)/i,
 ];
 
-const SBI_UTR_PATTERNS = [
+const UTR_PATTERNS = [
     /upi\s+ref\s+no\s*[:\.]?\s*(\d{12,})/i,
     /upi\s+ref[:\s#]*(\d{12,})/i,
     /ref\s+no\s*[:\.]?\s*(\d{12,})/i,
     /utr[:\s#]*([a-z0-9]{12,22})/i,
 ];
 
-const SBI_SENDERS = ['SBIUPI', 'SBIINB', 'SBIPSG', 'SBI', 'SBIALRT', 'SBIBNK'];
+const BANK_VPA_MAP: Record<string, string> = {
+    'SBI': 'SBI',
+    'IDBI': 'IDBI',
+    'HDFC': 'HDFC',
+    'ICICI': 'ICICI',
+    'AXIS': 'AXIS',
+    'KOTAK': 'KOTAK',
+    'BOB': 'BOB',
+    'PNB': 'PNB'
+};
 
-function isSBISender(sender: string): boolean {
-    return SBI_SENDERS.some(s => sender.toUpperCase().includes(s));
+function detectBank(sender: string, body: string): string {
+    const text = (sender + " " + body).toUpperCase();
+    for (const [key, val] of Object.entries(BANK_VPA_MAP)) {
+        if (text.includes(key)) return val;
+    }
+    return 'OTHER';
 }
 
 function isPaymentSMS(sms: string): boolean {
     const lower = sms.toLowerCase();
-    return ['credited', 'received', 'upi ref', 'upi ref no'].some(k => lower.includes(k));
+    return ['credited', 'received', 'upi ref', 'upi ref no', 'txn'].some(k => lower.includes(k));
 }
 
 function extractAmount(sms: string): number | null {
-    for (const pattern of SBI_PATTERNS) {
+    for (const pattern of PAYMENT_PATTERNS) {
         const match = sms.match(pattern);
         if (match?.[1]) {
             const amount = parseFloat(match[1].replace(/,/g, ''));
@@ -58,7 +72,7 @@ function extractAmount(sms: string): number | null {
 }
 
 function extractUTR(sms: string): string {
-    for (const pattern of SBI_UTR_PATTERNS) {
+    for (const pattern of UTR_PATTERNS) {
         const match = sms.match(pattern);
         if (match?.[1]) return match[1].toUpperCase();
     }
@@ -66,8 +80,9 @@ function extractUTR(sms: string): string {
 }
 
 function extractAccount(sms: string): string {
-    const match = sms.match(/a\/c\s+[xX*]+(\d{4})/i);
-    return match ? `XXXX${match[1]}` : 'N/A';
+    // Matches: A/c XXXX1234 or A/c NN66888
+    const match = sms.match(/[Aa]\/c\s+([A-Za-z0-9]*\d{3,})/i);
+    return match ? `...${match[1].slice(-4)}` : 'N/A';
 }
 
 // ─── POST: SMS Forwarder → Webhook ────────────────────────────────────────────
@@ -84,26 +99,25 @@ export async function POST(request: NextRequest) {
             return NextResponse.json({ success: false, error: 'No SMS text' }, { status: 400 });
         }
 
-        if (!isPaymentSMS(smsText)) {
-            return NextResponse.json({ success: true, action: 'ignored', reason: 'Not a payment SMS' });
-        }
+        // 🚨 IMPORTANT: Have temporarily disabled strict checks so YOU can see ALL SMS
+        // This means ANY SMS sent to this webhook will show up in Admin Panel
 
-        const amount = extractAmount(smsText);
-        if (!amount) {
-            return NextResponse.json({ success: true, action: 'ignored', reason: 'Amount not found' });
-        }
+        // Try to extract amount/UTR if possible, but don't fail if not found
+        const amount = extractAmount(smsText) || 0;
+        const utr = extractUTR(smsText);
+        const bank = detectBank(sender, smsText);
 
-        // ✅ Payment confirmed - store it
+        // ✅ Store EVERY SMS for now
         const record: PaymentRecord = {
-            id: `PAY_${Date.now()}`,
+            id: `SMS_${Date.now()}`,
             timestamp: new Date().toISOString(),
-            bank: isSBISender(sender) ? 'SBI' : 'OTHER',
+            bank: bank === 'OTHER' ? 'Unknown' : bank,
             sender,
-            amount,
-            utr: extractUTR(smsText),
+            amount: amount, // will be 0 if not a payment
+            utr: utr,
             account: extractAccount(smsText),
             smsText,
-            status: 'payment_received',
+            status: 'payment_received', // labeling all as received for display
         };
 
         payments.unshift(record); // newest first
